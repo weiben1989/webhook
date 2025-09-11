@@ -73,6 +73,9 @@ export default async function handler(req, res) {
       content = content.substring(0, 2000) + "\n\n...(消息过长已截断)";
     }
 
+    // 对最终内容进行UTF-8处理
+    content = ensureUTF8(content);
+
     // 发送到企业微信
     const resp = await fetch(process.env.WECHAT_WEBHOOK, {
       method: "POST",
