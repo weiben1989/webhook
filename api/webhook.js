@@ -86,8 +86,6 @@ export default async function handler(req, res) {
     });
 
     const result = await resp.json();
-    
-    res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.status(200).json({ ok: true, wechat: result });
 
   } catch (e) {
