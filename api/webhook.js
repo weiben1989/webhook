@@ -18,8 +18,54 @@ async function getRawBody(req) {
   });
 }
 
+// --- API Helper 1: Fetch from Sina ---
+async function getStockNameFromSina(stockCode, marketPrefix) {
+  const url = `https://hq.sinajs.cn/list=${marketPrefix}${stockCode}`;
+  console.log(`[DEBUG] Trying Sina API: ${url}`);
+  try {
+    const response = await fetch(url, { timeout: 3000 }); // 3 seconds timeout
+    if (!response.ok) return null;
+    
+    const responseBuffer = await response.arrayBuffer();
+    const responseText = new TextDecoder('gbk').decode(responseBuffer);
+    
+    const parts = responseText.split('"');
+    if (parts.length > 1 && parts[1] && parts[1].length > 1) {
+      return parts[1].split(',')[0];
+    }
+    return null;
+  } catch (error) {
+    console.error(`[DEBUG] Sina API Error:`, error.message);
+    return null;
+  }
+}
+
+// --- API Helper 2: Fetch from Tencent ---
+async function getStockNameFromTencent(stockCode, marketPrefix) {
+  const url = `https://qt.gtimg.cn/q=${marketPrefix}${stockCode}`;
+  console.log(`[DEBUG] Trying Tencent API: ${url}`);
+  try {
+    const response = await fetch(url, { timeout: 3000 }); // 3 seconds timeout
+    if (!response.ok) return null;
+
+    const responseBuffer = await response.arrayBuffer();
+    const responseText = new TextDecoder('gbk').decode(responseBuffer);
+
+    // Tencent format: v_sz002074="51~国轩高科~002074~..."
+    const parts = responseText.split('~');
+    if (parts.length > 1 && parts[1]) {
+      return parts[1];
+    }
+    return null;
+  } catch (error) {
+    console.error(`[DEBUG] Tencent API Error:`, error.message);
+    return null;
+  }
+}
+
+
 /**
- * Fetches the Chinese name of a stock from Sina Finance API.
+ * Fetches the Chinese name of a stock using multiple APIs as fallbacks.
  * @param {string} stockCode The stock code (e.g., '002074').
  * @returns {Promise<string|null>} The Chinese name or null if not found.
  */
@@ -34,34 +80,23 @@ async function getChineseStockName(stockCode) {
     return null;
   }
 
-  const url = `https://hq.sinajs.cn/list=${marketPrefix}${stockCode}`;
-  console.log(`[DEBUG] Fetching URL: ${url}`);
-  
-  try {
-    const response = await fetch(url);
-    if (!response.ok) {
-        console.error(`[DEBUG] API response not OK. Status: ${response.status}`);
-        return null;
-    }
-    
-    const responseBuffer = await response.arrayBuffer();
-    const responseText = new TextDecoder('gbk').decode(responseBuffer);
-    console.log(`[DEBUG] Raw API Response: ${responseText}`);
-    
-    const parts = responseText.split('"');
-    if (parts.length > 1 && parts[1]) {
-      const stockData = parts[1].split(',');
-      const chineseName = stockData[0];
-      console.log(`[DEBUG] Parsed Chinese Name: ${chineseName}`);
-      return chineseName;
-    } else {
-      console.log(`[DEBUG] Could not parse name from response.`);
-      return null;
-    }
-  } catch (error) {
-    console.error(`[DEBUG] API fetch error for ${stockCode}:`, error);
-    return null;
+  // --- Engine 1: Try Sina first ---
+  let chineseName = await getStockNameFromSina(stockCode, marketPrefix);
+  if (chineseName) {
+    console.log(`[DEBUG] Success from Sina API. Name: ${chineseName}`);
+    return chineseName;
   }
+
+  // --- Engine 2: Fallback to Tencent ---
+  console.log(`[DEBUG] Sina API failed or returned empty, falling back to Tencent.`);
+  chineseName = await getStockNameFromTencent(stockCode, marketPrefix);
+  if (chineseName) {
+    console.log(`[DEBUG] Success from Tencent API. Name: ${chineseName}`);
+    return chineseName;
+  }
+
+  console.log(`[DEBUG] All APIs failed for stock code: ${stockCode}`);
+  return null;
 }
 
 
@@ -108,13 +143,13 @@ export default async function handler(req, res) {
       const chineseName = await getChineseStockName(stockCode);
       
       if (chineseName) {
-        console.log(`[DEBUG] Translation successful. Name: ${chineseName}`);
+        console.log(`[DEBUG] Translation successful. Final Name: ${chineseName}`);
         finalContent = messageBody.replace(
           /标的:.*?\n/, 
           `标的: ${chineseName} (${stockCode})\n`
         );
       } else {
-        console.log(`[DEBUG] Translation failed. Chinese name not found.`);
+        console.log(`[DEBUG] Translation failed. Chinese name not found from any API.`);
       }
     } else {
         console.log(`[DEBUG] No stock code found in message body.`);
