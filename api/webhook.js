@@ -24,59 +24,61 @@ async function getRawBody(req) {
  * @returns {Promise<string|null>} The Chinese name or null if not found.
  */
 async function getChineseStockName(stockCode) {
-  // Determine market prefix (sh for Shanghai, sz for Shenzhen)
   let marketPrefix;
   if (stockCode.startsWith('6')) {
     marketPrefix = 'sh';
   } else if (stockCode.startsWith('0') || stockCode.startsWith('3')) {
     marketPrefix = 'sz';
   } else {
-    // Can add more rules for other markets (e.g., hk, us) if needed
+    console.log(`[DEBUG] Unknown market for stock code: ${stockCode}`);
     return null;
   }
 
   const url = `https://hq.sinajs.cn/list=${marketPrefix}${stockCode}`;
+  console.log(`[DEBUG] Fetching URL: ${url}`);
   
   try {
     const response = await fetch(url);
-    if (!response.ok) return null;
-
-    // The response is text, not JSON, and needs to be decoded correctly.
-    // GBK is often used by these older APIs.
+    if (!response.ok) {
+        console.error(`[DEBUG] API response not OK. Status: ${response.status}`);
+        return null;
+    }
+    
     const responseBuffer = await response.arrayBuffer();
     const responseText = new TextDecoder('gbk').decode(responseBuffer);
+    console.log(`[DEBUG] Raw API Response: ${responseText}`);
     
-    // Response format: var hq_str_sz002074="国轩高科,..."
     const parts = responseText.split('"');
-    if (parts.length > 1) {
+    if (parts.length > 1 && parts[1]) {
       const stockData = parts[1].split(',');
-      if (stockData[0]) {
-        return stockData[0]; // The first part is the Chinese name
-      }
+      const chineseName = stockData[0];
+      console.log(`[DEBUG] Parsed Chinese Name: ${chineseName}`);
+      return chineseName;
+    } else {
+      console.log(`[DEBUG] Could not parse name from response.`);
+      return null;
     }
-    return null;
   } catch (error) {
-    console.error(`API Error fetching stock name for ${stockCode}:`, error);
+    console.error(`[DEBUG] API fetch error for ${stockCode}:`, error);
     return null;
   }
 }
 
 
 export default async function handler(req, res) {
+  console.log(`\n--- New Request Received at ${new Date().toISOString()} ---`);
   try {
-    // 1. 安全检查：只接受 POST 请求
     if (req.method !== 'POST') {
       res.setHeader('Allow', 'POST');
       return res.status(405).json({ error: 'Method Not Allowed' });
     }
 
-    // 企业微信 webhook 地址
     const webhookURL = 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=cee69a01-8397-486c-a820-f44cd5181313';
 
     const rawBodyBuffer = await getRawBody(req);
     const rawBody = rawBodyBuffer.toString('utf8');
+    console.log('[DEBUG] Received Raw Body:', rawBody);
 
-    // 2. 智能解析请求体
     let messageBody;
     const contentType = req.headers['content-type'] || '';
     
@@ -96,22 +98,29 @@ export default async function handler(req, res) {
       }
     } 
 
-    // 3. 翻译股票名称 (现在通过API动态查询)
     let finalContent = messageBody;
     const stockMatch = messageBody.match(/标的:.*\(([^)]+)\)/);
+
     if (stockMatch && stockMatch[1]) {
       const stockCode = stockMatch[1];
-      // Call the new API function
+      console.log(`[DEBUG] Matched stock code: ${stockCode}`);
+
       const chineseName = await getChineseStockName(stockCode);
+      
       if (chineseName) {
+        console.log(`[DEBUG] Translation successful. Name: ${chineseName}`);
         finalContent = messageBody.replace(
           /标的:.*?\n/, 
           `标的: ${chineseName} (${stockCode})\n`
         );
+      } else {
+        console.log(`[DEBUG] Translation failed. Chinese name not found.`);
       }
+    } else {
+        console.log(`[DEBUG] No stock code found in message body.`);
     }
 
-    // 4. 发送到企业微信
+    console.log('[DEBUG] Final content to be sent:', finalContent);
     const wechatResponse = await fetch(webhookURL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -127,7 +136,6 @@ export default async function handler(req, res) {
         throw new Error(`Failed to send message to WeChat: ${wechatResult.errmsg || 'Unknown error'}`);
     }
 
-    // 5. 向 TradingView 返回成功响应
     return res.status(200).json({ success: true, message: 'Alert forwarded successfully' });
 
   } catch (error) {
