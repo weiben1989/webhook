@@ -42,7 +42,12 @@ async function getStockNameFromSina(stockCode, marketPrefix) {
 
 // --- API Helper 2: Fetch from Tencent ---
 async function getStockNameFromTencent(stockCode, marketPrefix) {
-  const url = `https://qt.gtimg.cn/q=${marketPrefix}${stockCode}`;
+  let finalStockCode = stockCode;
+  if (marketPrefix === 'hk') {
+    // Tencent API requires HK stock codes to be padded to 5 digits
+    finalStockCode = stockCode.padStart(5, '0');
+  }
+  const url = `https://qt.gtimg.cn/q=${marketPrefix}${finalStockCode}`;
   console.log(`[DEBUG] Trying Tencent API: ${url}`);
   try {
     const response = await fetch(url, { timeout: 3000 }); // 3 seconds timeout
@@ -51,7 +56,7 @@ async function getStockNameFromTencent(stockCode, marketPrefix) {
     const responseBuffer = await response.arrayBuffer();
     const responseText = new TextDecoder('gbk').decode(responseBuffer);
 
-    // Tencent format: v_sz002074="51~国轩高科~002074~..."
+    // Tencent format: v_sz002074="51~国轩高科~002074~..." or v_hk00268="51~金蝶国际~..."
     const parts = responseText.split('~');
     if (parts.length > 1 && parts[1]) {
       return parts[1];
@@ -71,12 +76,22 @@ async function getStockNameFromTencent(stockCode, marketPrefix) {
  */
 async function getChineseStockName(stockCode) {
   let marketPrefix;
-  if (stockCode.startsWith('6')) {
-    marketPrefix = 'sh';
-  } else if (stockCode.startsWith('0') || stockCode.startsWith('3')) {
-    marketPrefix = 'sz';
-  } else {
-    console.log(`[DEBUG] Unknown market for stock code: ${stockCode}`);
+
+  // Rule for Hong Kong Stocks (numeric, <= 5 digits)
+  if (stockCode.length <= 5) {
+    marketPrefix = 'hk';
+  } 
+  // Rule for A-Share Stocks & ETFs (numeric, 6 digits)
+  else if (stockCode.length === 6) {
+    if (stockCode.startsWith('6') || stockCode.startsWith('51')) {
+      marketPrefix = 'sh'; // Shanghai Stock & ETF
+    } else if (stockCode.startsWith('0') || stockCode.startsWith('3') || stockCode.startsWith('15')) {
+      marketPrefix = 'sz'; // Shenzhen Stock & ETF
+    }
+  }
+
+  if (!marketPrefix) {
+    console.log(`[DEBUG] No known market rule for stock code: ${stockCode}`);
     return null;
   }
 
@@ -138,21 +153,28 @@ export default async function handler(req, res) {
 
     if (stockMatch && stockMatch[1]) {
       const stockCode = stockMatch[1];
-      console.log(`[DEBUG] Matched stock code: ${stockCode}`);
+      console.log(`[DEBUG] Matched asset code: ${stockCode}`);
 
-      const chineseName = await getChineseStockName(stockCode);
+      // --- Smart Translation Gate ---
+      // Only attempt to translate if the code is purely numeric
+      if (/^\d+$/.test(stockCode)) {
+        console.log(`[DEBUG] Numeric code detected. Attempting translation...`);
+        const chineseName = await getChineseStockName(stockCode);
       
-      if (chineseName) {
-        console.log(`[DEBUG] Translation successful. Final Name: ${chineseName}`);
-        finalContent = messageBody.replace(
-          /标的:.*?\n/, 
-          `标的: ${chineseName} (${stockCode})\n`
-        );
+        if (chineseName) {
+          console.log(`[DEBUG] Translation successful. Final Name: ${chineseName}`);
+          finalContent = messageBody.replace(
+            /标的:.*?\n/, 
+            `标的: ${chineseName} (${stockCode})\n`
+          );
+        } else {
+          console.log(`[DEBUG] Translation failed. Chinese name not found from any API.`);
+        }
       } else {
-        console.log(`[DEBUG] Translation failed. Chinese name not found from any API.`);
+        console.log(`[DEBUG] Alphanumeric code (${stockCode}) detected. Skipping translation.`);
       }
     } else {
-        console.log(`[DEBUG] No stock code found in message body.`);
+        console.log(`[DEBUG] No asset code found in parentheses in the message body.`);
     }
 
     console.log('[DEBUG] Final content to be sent:', finalContent);
