@@ -88,8 +88,14 @@ async function getChineseStockName(stockCode) {
     }
     console.log(`[DEBUG] Identified market '${marketPrefix}' for stock code: ${stockCode}`);
     let chineseName = await getStockNameFromSina(stockCode, marketPrefix);
-    if (chineseName) return chineseName;
+    if (chineseName) {
+        console.log(`[DEBUG] Sina returned name: ${chineseName}`);
+        return chineseName;
+    }
     chineseName = await getStockNameFromTencent(stockCode, marketPrefix);
+    if (chineseName) {
+        console.log(`[DEBUG] Tencent returned name: ${chineseName}`);
+    }
     return chineseName;
 }
 
@@ -97,30 +103,38 @@ async function getChineseStockName(stockCode) {
 async function processMessage(body) {
     let debugReport = [];
     debugReport.push(`1. Original Body (raw):\n---\n${body}\n---`);
-    debugReport.push(`2. Body as Hex to see hidden chars:\n---\n${Buffer.from(body).toString('hex')}\n---`);
+    debugReport.push(`2. Body length: ${body.length}, Contains newline: ${body.includes('\n')}`);
     
     let messageToProcess = body;
     let finalContent = messageToProcess;
 
-    // --- 改进的单行处理器 ---
-    // 这个正则现在可以匹配: "标的: 159565, 周期: 5..." 这种格式
-    // 允许标的和代码之间有空格，并且代码后面可以跟逗号
-    const singleLineMatch = messageToProcess.match(/^标的\s*[:：]\s*(\d{5,6})\s*[,，]?\s*(.*)$/);
+    // 先尝试单行格式匹配（无论是否有换行，都先试试）
+    const singleLineRegex = /标的\s*[:：]\s*(\d{5,6})\s*[,，]?\s*(.*)/;
+    const singleLineMatch = messageToProcess.match(singleLineRegex);
     
-    if (singleLineMatch && !messageToProcess.includes('\n')) {
-        debugReport.push("3. Special Single-Line Processor Triggered: YES");
+    console.log(`[DEBUG] Single-line regex match: ${!!singleLineMatch}`);
+    
+    if (singleLineMatch) {
+        debugReport.push("3. Single-Line Pattern Detected: YES");
         
-        const stockCode = singleLineMatch[1];        // "159565"
-        let remainderPart = singleLineMatch[2];      // "周期: 5, 旗开得胜买信号!..."
+        const stockCode = singleLineMatch[1];
+        let remainderPart = singleLineMatch[2];
+        
+        console.log(`[DEBUG] Extracted stock code: ${stockCode}`);
+        console.log(`[DEBUG] Remainder: ${remainderPart}`);
         
         debugReport.push(`4. Found Code: '${stockCode}'`);
+        debugReport.push(`5. Remainder: '${remainderPart}'`);
         
         // 清理开头的逗号和空格
         remainderPart = remainderPart.replace(/^[,，\s]+/, '');
 
         // 获取股票中文名称
+        console.log(`[DEBUG] Fetching Chinese name for: ${stockCode}`);
         const chineseName = await getChineseStockName(stockCode);
-        debugReport.push(`5. API Result for '${stockCode}': '${chineseName || 'FAILED'}'`);
+        console.log(`[DEBUG] Chinese name result: ${chineseName || 'NULL'}`);
+        
+        debugReport.push(`6. API Result for '${stockCode}': '${chineseName || 'FAILED'}'`);
 
         let formattedStockLine;
         if (chineseName) {
@@ -129,38 +143,24 @@ async function processMessage(body) {
             formattedStockLine = `标的:(${stockCode})`;
         }
         
-        // 组合格式化后的内容
-        finalContent = `${formattedStockLine}\n${remainderPart}`;
-        debugReport.push(`6. Final Formatted Content:\n---\n${finalContent}\n---`);
-
-    } else {
-        // --- 多行消息的回退处理 ---
-        debugReport.push("3. Special Single-Line Processor Triggered: NO. Using standard multi-line enhancer.");
-        
-        const alreadyFormattedMatch = messageToProcess.match(/标的\s*[:：].*?[（(]\s*\d{5,6}\s*[)）]/);
-        if (alreadyFormattedMatch) {
-            debugReport.push("5. Name Enhancer: SKIPPED (already formatted).");
-            finalContent = messageToProcess;
+        // 如果原文是单行，就用换行分隔；如果是多行，就替换第一行
+        if (!messageToProcess.includes('\n')) {
+            finalContent = `${formattedStockLine}\n${remainderPart}`;
         } else {
-            const codeMatch = messageToProcess.match(/(标的\s*[:：]\s*\d{5,6})/);
-            if (codeMatch) {
-                const stringToReplace = codeMatch[0];
-                const stockCode = stringToReplace.match(/\d{5,6}/)[0];
-                debugReport.push(`5. Name Enhancer: FOUND code '${stockCode}'.`);
-
-                const chineseName = await getChineseStockName(stockCode);
-                if (chineseName) {
-                    debugReport.push(`6. API Result: SUCCESS, found name '${chineseName}'.`);
-                    const prefix = stringToReplace.substring(0, stringToReplace.indexOf(stockCode));
-                    const replacementString = `${prefix.trim()} ${chineseName}（${stockCode}）`;
-                    finalContent = messageToProcess.replace(stringToReplace, replacementString);
-                } else {
-                    debugReport.push(`6. API Result: FAILED, no name found.`);
-                }
-            } else {
-                debugReport.push("5. Name Enhancer: SKIPPED (no code found).");
+            // 多行情况：替换第一个匹配项
+            const originalMatch = messageToProcess.match(/标的\s*[:：]\s*\d{5,6}/);
+            if (originalMatch) {
+                finalContent = messageToProcess.replace(originalMatch[0], formattedStockLine);
             }
         }
+        
+        debugReport.push(`7. Final Formatted Content:\n---\n${finalContent}\n---`);
+
+    } else {
+        // 完全没有匹配到股票代码格式
+        debugReport.push("3. Single-Line Pattern Detected: NO");
+        debugReport.push("4. No stock code pattern found, returning original message.");
+        console.log(`[DEBUG] No stock pattern matched in message`);
     }
 
     return { finalContent, debugInfo: debugReport.join('\n') };
@@ -177,6 +177,8 @@ export default async function handler(req, res) {
     const proxyKey = requestUrl.searchParams.get('key');
     const isDebugMode = requestUrl.searchParams.get('debug') === 'true';
 
+    console.log(`[PROXY] Request received - Key: ${proxyKey}, Debug: ${isDebugMode}`);
+
     if (!proxyKey) {
         return res.status(400).json({ error: "Missing 'key' parameter." });
     }
@@ -189,48 +191,52 @@ export default async function handler(req, res) {
     const destinationType = proxyConfig.type || 'raw'; 
 
     const rawBody = (await getRawBody(req)).toString('utf8');
+    console.log(`[PROXY] Raw body received: ${rawBody}`);
     
     let messageBody;
     try {
         const alertData = JSON.parse(rawBody);
+        console.log(`[PROXY] Parsed as JSON, converting to text...`);
         messageBody = Object.entries(alertData)
           .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
           .join('\n');
+        console.log(`[PROXY] Converted message: ${messageBody}`);
     } catch (e) {
+        console.log(`[PROXY] Not JSON, using raw body`);
         messageBody = rawBody;
     }
     
-    // CRITICAL FIX: Trim the body before any processing
     const trimmedBody = messageBody.trim();
-    console.log(`[DEBUG] Received and trimmed message body: ${trimmedBody}`);
+    console.log(`[PROXY] Trimmed body: ${trimmedBody}`);
 
     // --- Apply all processing ---
     const { finalContent, debugInfo } = await processMessage(trimmedBody);
+    console.log(`[PROXY] Processed content: ${finalContent}`);
     
-    // --- CONFIRMATION MARKER ---
-    // Add a clear marker to confirm this specific script version is running.
-    const confirmationMarker = "[PROXY V2025-10-14-FIXED] ";
-    let messageToSend = confirmationMarker + finalContent;
-    // --- END CONFIRMATION MARKER ---
+    // 版本标记
+    let messageToSend = `✅ ${finalContent}`;
     
     if (isDebugMode) {
         messageToSend += `\n\n--- 诊断报告 ---\n${debugInfo}`;
     }
 
+    console.log(`[PROXY] Final message to send: ${messageToSend}`);
+
     // --- INTELLIGENT PAYLOAD FORMATTING ---
-    console.log(`[DEBUG] Final content being sent: ${messageToSend}`);
     let forwardResponse;
     if (destinationType === 'wecom') {
         const payload = {
             msgtype: 'markdown',
             markdown: { content: messageToSend },
         };
+        console.log(`[PROXY] Sending to WeCom with payload: ${JSON.stringify(payload)}`);
         forwardResponse = await fetch(finalWebhookUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(payload),
         });
     } else {
+        console.log(`[PROXY] Sending as plain text`);
         forwardResponse = await fetch(finalWebhookUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain; charset=utf-8' },
@@ -238,8 +244,11 @@ export default async function handler(req, res) {
         });
     }
 
+    const responseText = await forwardResponse.text();
+    console.log(`[PROXY] Forward response status: ${forwardResponse.status}, body: ${responseText}`);
+
     if (!forwardResponse.ok) {
-        console.error(`[PROXY] Failed to forward. Key: ${proxyKey}, Type: ${destinationType}, Status: ${forwardResponse.status}, Body: ${await forwardResponse.text()}`);
+        console.error(`[PROXY] Failed to forward. Key: ${proxyKey}, Type: ${destinationType}, Status: ${forwardResponse.status}`);
     } else {
         console.log(`[PROXY] Successfully forwarded alert for key '${proxyKey}'.`);
     }
