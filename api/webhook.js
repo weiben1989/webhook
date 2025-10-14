@@ -13,7 +13,7 @@ async function getRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('end', ' => resolve(Buffer.concat(chunks)));
     req.on('error', (err) => reject(err));
   });
 }
@@ -114,17 +114,15 @@ async function getChineseStockName(stockCode) {
 }
 
 /**
- * NEW: Extracts a stock code from the message body using a list of regex patterns.
+ * Extracts a stock code from the message body using a list of regex patterns.
  * @param {string} body The message body text.
  * @returns {{stockCode: string, originalText: string}|null} An object with the code and the full text that was matched, or null.
  */
 function extractStockCode(body) {
-    // --- Rule Engine for Stock Code Extraction ---
-    // Add new regex patterns here to support more message formats.
     const patterns = [
-        /标的:.*\(([^)]+)\)/,        // Original: 标的: XX (000001)
-        /(?:标的|合约|symbol|ticker):\s*([a-zA-Z0-9\.]+)/i, // Key: code, e.g. 标的: 000001 or symbol: AAPL
-        /"ticker"\s*:\s*"([^"]+)"/, // JSON-like: "ticker": "000001"
+        /标的:.*\(([^)]+)\)/,
+        /(?:标的|合约|symbol|ticker):\s*([a-zA-Z0-9\.]+)/i,
+        /"ticker"\s*:\s*"([^"]+)"/,
     ];
 
     for (const pattern of patterns) {
@@ -132,14 +130,13 @@ function extractStockCode(body) {
         if (match && match[1]) {
             console.log(`[DEBUG] Matched with pattern: ${pattern}`);
             return {
-                stockCode: match[1],      // The captured stock code
-                originalText: match[0],   // The full string that was matched by the regex
+                stockCode: match[1],
+                originalText: match[0],
             };
         }
     }
     return null;
 }
-
 
 export default async function handler(req, res) {
   console.log(`\n--- New Request Received at ${new Date().toISOString()} ---`);
@@ -149,7 +146,6 @@ export default async function handler(req, res) {
       return res.status(405).json({ error: 'Method Not Allowed' });
     }
 
-    // BEST PRACTICE: Use environment variables for secrets like webhook URLs
     const webhookURL = process.env.WECHAT_WEBHOOK_URL || 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=cee69a01-8397-486c-a820-f44cd5181313';
 
     const rawBodyBuffer = await getRawBody(req);
@@ -159,36 +155,32 @@ export default async function handler(req, res) {
     let messageBody;
     const contentType = req.headers['content-type'] || '';
     
-    // Simplified body processing
     if (contentType.includes('application/json')) {
       const jsonData = JSON.parse(rawBody);
       messageBody = Object.entries(jsonData)
           .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
           .join('\n');
     } else {
-      // For text/plain or other types, just use the raw body
       messageBody = rawBody;
     }
 
     let finalContent = messageBody;
     
-    // --- Use the new flexible extraction function ---
+    // --- 核心步骤: 只处理股票代码 ---
     const stockInfo = extractStockCode(messageBody);
-
     if (stockInfo) {
       const { stockCode, originalText } = stockInfo;
       console.log(`[DEBUG] Matched asset code: ${stockCode} from text: "${originalText}"`);
-
-      // Attempt to get the Chinese name
+      
       const chineseName = await getChineseStockName(stockCode);
       
       if (chineseName) {
         console.log(`[DEBUG] Translation successful. Final Name: ${chineseName}`);
         const replacementText = `标的: ${chineseName} (${stockCode})`;
-        // Replace only the originally matched text, which is more precise
         finalContent = messageBody.replace(originalText, replacementText);
       } else {
-        console.log(`[DEBUG] Translation failed. Chinese name not found from any API.`);
+        console.log(`[DEBUG] Translation failed. Using original message.`);
+        // 如果查询失败，finalContent 保持为原始的 messageBody，不做任何改动
       }
     } else {
         console.log(`[DEBUG] No asset code found in the message body using any pattern.`);
@@ -217,3 +209,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Internal Server Error' });
   }
 }
+
