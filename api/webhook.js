@@ -81,7 +81,7 @@ async function getChineseStockName(stockCode) {
         }
     }
     if (!marketPrefix) {
-        console.log(`[DEBUG] No market prefix found for stock code: ${stockCode}. (Ignoring, likely not A-share/HK)`);
+        console.log(`[DEBUG] No market prefix found for stock code: ${stockCode}.`);
         return null;
     }
     console.log(`[DEBUG] Identified market '${marketPrefix}' for stock code: ${stockCode}`);
@@ -91,68 +91,81 @@ async function getChineseStockName(stockCode) {
     return chineseName;
 }
 
-// --- Message Processing Function ---
+// --- Message Processing Function with Debug Info ---
 async function processMessage(body) {
+    let debugReport = [];
+    debugReport.push(`1. Original Body (raw):\n---\n${body}\n---`);
+    debugReport.push(`2. Body as Hex to see hidden chars:\n---\n${Buffer.from(body).toString('hex')}\n---`);
+    
     let messageToProcess = body;
+    let finalContent = messageToProcess; // Default to original message
 
-    // --- Pre-formatter for single-line signals (Robust Version) ---
-    if (!messageToProcess.includes('\n') && messageToProcess.includes('标的:') && messageToProcess.includes(',')) {
-        console.log('[DEBUG] Single-line signal detected. Applying new, robust multi-line formatting.');
+    // --- New, Robust Single-Line Processor ---
+    // This regex specifically targets the single-line format you described.
+    // It captures the stock part and the rest of the message separately.
+    const singleLineMatch = messageToProcess.match(/^(标的\s*[:：]\s*\d{5,6})(.*)$/);
+    
+    // This logic only runs if the message is a single line AND it matches our pattern.
+    if (singleLineMatch && !messageToProcess.includes('\n')) {
+        debugReport.push("3. Special Single-Line Processor Triggered: YES");
         
-        let tempBody = messageToProcess;
-        
-        // Keywords that should always start a new line
-        const keywords = ['周期:', '信号:', '级别:', '交易所时间:', '价格:', '原因:', '当前价格:'];
-        
-        // Step 1: Place a newline before each keyword, consuming any leading comma/space.
-        keywords.forEach(keyword => {
-            const regex = new RegExp(`[\\s,]*(${keyword})`, 'g');
-            tempBody = tempBody.replace(regex, `\n$1`);
-        });
-        
-        // Step 2: Replace any remaining commas (with optional following space) with a newline.
-        tempBody = tempBody.replace(/,\s*/g, '\n');
-        
-        // Step 3: Final cleanup to ensure consistent formatting
-        messageToProcess = tempBody.split('\n')
-                                    .map(line => line.trim())
-                                    .filter(line => line) // Remove any potential empty lines
-                                    .join('\n');
-        console.log(`[DEBUG] Pre-formatted message:\n${messageToProcess}`);
-    }
+        let stockPart = singleLineMatch[1];      // e.g., "标的: 159565"
+        let remainderPart = singleLineMatch[2]; // e.g., ", 周期: 5..."
 
+        const stockCode = stockPart.match(/\d{5,6}/)[0];
+        debugReport.push(`4. Found Code: '${stockCode}'`);
 
-    // --- Stock Name Enhancer ---
-    const alreadyFormattedMatch = messageToProcess.match(/标的\s*[:：].*?[（(]\s*\d{5,6}\s*[)）]/);
-    if (alreadyFormattedMatch) {
-        console.log(`[DEBUG] Message appears to be already name-formatted. No further action needed.`);
-        return messageToProcess;
-    }
+        // Clean up the remainder part by removing leading comma and spaces
+        remainderPart = remainderPart.replace(/^[\s,]+/, '');
 
-    const codeMatch = messageToProcess.match(/(标的\s*[:：]\s*\d{5,6})/);
-    if (codeMatch) {
-        const stringToReplace = codeMatch[0];
-        const stockCode = stringToReplace.match(/\d{5,6}/)[0];
-
-        console.log(`[DEBUG] Found code '${stockCode}' to process in block '${stringToReplace}'.`);
-        
+        // Fetch the Chinese name for the stock
         const chineseName = await getChineseStockName(stockCode);
-        console.log(`[DEBUG] Fetched stock name: '${chineseName}' for code '${stockCode}'`);
+        debugReport.push(`5. API Result for '${stockCode}': '${chineseName || 'FAILED'}'`);
 
+        let formattedStockLine;
         if (chineseName) {
-            const prefix = stringToReplace.substring(0, stringToReplace.indexOf(stockCode));
-            const replacementString = `${prefix}${chineseName} （${stockCode}）`;
-            const newBody = messageToProcess.replace(stringToReplace, replacementString);
-            console.log(`[DEBUG] Content successfully replaced.`);
-            return newBody;
+            // Format as "标的:中文名(CODE)" per your request (no space, with parentheses)
+            formattedStockLine = `标的:${chineseName}(${stockCode})`;
         } else {
-            console.log(`[DEBUG] No Chinese name found. Name will not be added.`);
+            // Fallback format if name lookup fails
+            formattedStockLine = `标的:(${stockCode})`;
         }
+        
+        // Combine the newly formatted stock line with the rest of the message on a new line
+        finalContent = `${formattedStockLine}\n${remainderPart}`;
+        debugReport.push(`6. Final Formatted Content:\n---\n${finalContent}\n---`);
+
     } else {
-        console.log('[DEBUG] No replaceable stock code found.');
+        // --- Fallback for multi-line messages or other formats ---
+        debugReport.push("3. Special Single-Line Processor Triggered: NO. Using standard multi-line enhancer.");
+        
+        const alreadyFormattedMatch = messageToProcess.match(/标的\s*[:：].*?[（(]\s*\d{5,6}\s*[)）]/);
+        if (alreadyFormattedMatch) {
+            debugReport.push("5. Name Enhancer: SKIPPED (already formatted).");
+            finalContent = messageToProcess;
+        } else {
+            const codeMatch = messageToProcess.match(/(标的\s*[:：]\s*\d{5,6})/);
+            if (codeMatch) {
+                const stringToReplace = codeMatch[0];
+                const stockCode = stringToReplace.match(/\d{5,6}/)[0];
+                debugReport.push(`5. Name Enhancer: FOUND code '${stockCode}'.`);
+
+                const chineseName = await getChineseStockName(stockCode);
+                if (chineseName) {
+                    debugReport.push(`6. API Result: SUCCESS, found name '${chineseName}'.`);
+                    const prefix = stringToReplace.substring(0, stringToReplace.indexOf(stockCode));
+                    const replacementString = `${prefix.trim()} ${chineseName}（${stockCode}）`;
+                    finalContent = messageToProcess.replace(stringToReplace, replacementString);
+                } else {
+                    debugReport.push(`6. API Result: FAILED, no name found.`);
+                }
+            } else {
+                debugReport.push("5. Name Enhancer: SKIPPED (no code found).");
+            }
+        }
     }
 
-    return messageToProcess;
+    return { finalContent, debugInfo: debugReport.join('\n') };
 }
 
 
@@ -164,6 +177,7 @@ export default async function handler(req, res) {
     
     const requestUrl = new URL(req.url, `https://${req.headers.host}`);
     const proxyKey = requestUrl.searchParams.get('key');
+    const isDebugMode = requestUrl.searchParams.get('debug') === 'true';
 
     if (!proxyKey) {
         return res.status(400).json({ error: "Missing 'key' parameter." });
@@ -187,18 +201,31 @@ export default async function handler(req, res) {
     } catch (e) {
         messageBody = rawBody;
     }
-    console.log(`[DEBUG] Received message body: ${messageBody}`);
+    
+    // CRITICAL FIX: Trim the body before any processing
+    const trimmedBody = messageBody.trim();
+    console.log(`[DEBUG] Received and trimmed message body: ${trimmedBody}`);
 
     // --- Apply all processing ---
-    const finalContent = await processMessage(messageBody);
+    const { finalContent, debugInfo } = await processMessage(trimmedBody);
+    
+    // --- CONFIRMATION MARKER ---
+    // Add a clear marker to confirm this specific script version is running.
+    const confirmationMarker = "[PROXY V2025-10-14 PROCESSED] ";
+    let messageToSend = confirmationMarker + finalContent;
+    // --- END CONFIRMATION MARKER ---
+    
+    if (isDebugMode) {
+        messageToSend += `\n\n--- 诊断报告 ---\n${debugInfo}`;
+    }
 
     // --- INTELLIGENT PAYLOAD FORMATTING ---
-    console.log(`[DEBUG] Final content being sent: ${finalContent}`);
+    console.log(`[DEBUG] Final content being sent: ${messageToSend}`);
     let forwardResponse;
     if (destinationType === 'wecom') {
         const payload = {
             msgtype: 'markdown',
-            markdown: { content: finalContent },
+            markdown: { content: messageToSend },
         };
         forwardResponse = await fetch(finalWebhookUrl, {
             method: 'POST',
@@ -209,7 +236,7 @@ export default async function handler(req, res) {
         forwardResponse = await fetch(finalWebhookUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'text/plain; charset=utf-8' },
-            body: finalContent,
+            body: messageToSend,
         });
     }
 
@@ -226,5 +253,6 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Internal Server Error' });
   }
 }
+
 
 
