@@ -120,8 +120,8 @@ async function getChineseStockName(stockCode) {
  */
 function extractStockCode(body) {
     const patterns = [
-        /标的:.*\(([^)]+)\)/,
-        /(?:标的|合约|symbol|ticker):\s*([a-zA-Z0-9\.]+)/i,
+        /标的[:：].*\(([^)]+)\)/, // Updated to accept both : and ：
+        /(?:标的|合约|symbol|ticker)[:：]\s*([a-zA-Z0-9\.]+)/i, // Updated to accept both : and ：
         /"ticker"\s*:\s*"([^"]+)"/,
     ];
 
@@ -209,5 +209,4 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Internal Server Error' });
   }
 }
-
 
