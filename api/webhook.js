@@ -1,7 +1,6 @@
 import fetch from "node-fetch";
 
 // Vercel/Next.js API route config
-// We disable the default bodyParser to handle raw body for encoding issues.
 export const config = {
   api: {
     bodyParser: false,
@@ -18,6 +17,24 @@ async function getRawBody(req) {
   });
 }
 
+// --- Text Pre-processing Helper ---
+/**
+ * Normalizes the text by replacing full-width characters with half-width,
+ * and trimming extra whitespace.
+ * @param {string} text The input text.
+ * @returns {string} The normalized text.
+ */
+function normalizeText(text) {
+    if (!text) return '';
+    return text
+        .replace(/[\uff01-\uff5e]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+        .replace(/\u3000/g, ' ') // Replace full-width space
+        .trim();
+}
+
+// --- API Helper 1: Fetch from Sina ---
+async function getStockNameFromSina(stockCode, marketPrefix) {
+  // ... (rest of the function is unchanged)
 // --- API Helper 1: Fetch from Sina ---
 async function getStockNameFromSina(stockCode, marketPrefix) {
   const url = `https://hq.sinajs.cn/list=${marketPrefix}${stockCode}`;
@@ -120,18 +137,21 @@ async function getChineseStockName(stockCode) {
  */
 function extractStockCode(body) {
     const patterns = [
-        /标的[:：].*\(([^)]+)\)/, // Updated to accept both : and ：
-        /(?:标的|合约|symbol|ticker)[:：]\s*([a-zA-Z0-9\.]+)/i, // Updated to accept both : and ：
+        /标的[:：][^(\n]*\(([^)]+)\)/,
+        /(?:标的|合约|symbol|ticker)[:：]\s*([a-zA-Z0-9\.]+)/i,
         /"ticker"\s*:\s*"([^"]+)"/,
+        /\b(\d{6})\b/ // Fallback rule: matches any standalone 6-digit number
     ];
 
     for (const pattern of patterns) {
         const match = body.match(pattern);
         if (match && match[1]) {
             console.log(`[DEBUG] Matched with pattern: ${pattern}`);
+            // For the fallback rule, the originalText is just the code itself
+            const originalText = pattern.source === '\\b(\\d{6})\\b' ? match[1] : match[0];
             return {
                 stockCode: match[1],
-                originalText: match[0],
+                originalText: originalText,
             };
         }
     }
@@ -151,17 +171,22 @@ export default async function handler(req, res) {
     const rawBodyBuffer = await getRawBody(req);
     const rawBody = rawBodyBuffer.toString('utf8');
     console.log('[DEBUG] Received Raw Body:', rawBody);
-
-    let messageBody;
-    const contentType = req.headers['content-type'] || '';
     
-    if (contentType.includes('application/json')) {
-      const jsonData = JSON.parse(rawBody);
-      messageBody = Object.entries(jsonData)
-          .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
-          .join('\n');
-    } else {
-      messageBody = rawBody;
+    const normalizedBody = normalizeText(rawBody);
+    console.log('[DEBUG] Normalized Body:', normalizedBody);
+
+    let messageBody = normalizedBody;
+    // Keep the JSON parsing logic for compatibility, but apply it to the normalized body
+    if (req.headers['content-type']?.includes('application/json')) {
+        try {
+            const jsonData = JSON.parse(normalizedBody);
+            messageBody = Object.entries(jsonData)
+                .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
+                .join('\n');
+        } catch(e) {
+            console.warn("[DEBUG] Content-Type is JSON, but body failed to parse. Treating as plain text.");
+            messageBody = normalizedBody;
+        }
     }
 
     let finalContent = messageBody;
@@ -176,11 +201,11 @@ export default async function handler(req, res) {
       
       if (chineseName) {
         console.log(`[DEBUG] Translation successful. Final Name: ${chineseName}`);
+        // If using the fallback rule, we prepend the text "标的: "
         const replacementText = `标的: ${chineseName} (${stockCode})`;
         finalContent = messageBody.replace(originalText, replacementText);
       } else {
         console.log(`[DEBUG] Translation failed. Using original message.`);
-        // 如果查询失败，finalContent 保持为原始的 messageBody，不做任何改动
       }
     } else {
         console.log(`[DEBUG] No asset code found in the message body using any pattern.`);
