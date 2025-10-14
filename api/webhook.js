@@ -13,7 +13,7 @@ async function getRawBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', ' => resolve(Buffer.concat(chunks)));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
     req.on('error', (err) => reject(err));
   });
 }
@@ -209,4 +209,5 @@ export default async function handler(req, res) {
     return res.status(500).json({ error: 'Internal Server Error' });
   }
 }
+
 
