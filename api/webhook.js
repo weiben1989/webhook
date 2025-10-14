@@ -1,237 +1,230 @@
 import fetch from "node-fetch";
+import { URL } from 'url';
 
 // Vercel/Next.js API route config
 export const config = {
-  api: {
-    bodyParser: false,
-  },
+  api: {
+    bodyParser: false,
+  },
 };
 
-// Helper function to read the raw request body as a buffer
+// --- Webhook Configuration ---
+let webhookMap = {};
+try {
+    if (process.env.WEBHOOK_CONFIG) {
+        webhookMap = JSON.parse(process.env.WEBHOOK_CONFIG);
+    } else {
+        console.warn("WARN: WEBHOOK_CONFIG environment variable is not set.");
+    }
+} catch (error) {
+    console.error("FATAL: Could not parse WEBHOOK_CONFIG. Please check its JSON format.", error);
+}
+
+// Helper function to read the raw request body
 async function getRawBody(req) {
-  return new Promise((resolve, reject) => {
-    const chunks = [];
-    req.on('data', (chunk) => chunks.push(chunk));
-    req.on('end', () => resolve(Buffer.concat(chunks)));
-    req.on('error', (err) => reject(err));
-  });
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => resolve(Buffer.concat(chunks)));
+    req.on('error', (err) => reject(err));
+  });
 }
 
-// --- Text Pre-processing Helper ---
-/**
- * Normalizes the text by replacing full-width characters with half-width,
- * and trimming extra whitespace.
- * @param {string} text The input text.
- * @returns {string} The normalized text.
- */
-function normalizeText(text) {
-    if (!text) return '';
-    return text
-        .replace(/[\uff01-\uff5e]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
-        .replace(/\u3000/g, ' ') // Replace full-width space
-        .trim();
-}
-
-// --- API Helper 1: Fetch from Sina ---
+// --- Stock Name API Helpers ---
 async function getStockNameFromSina(stockCode, marketPrefix) {
-  // ... (rest of the function is unchanged)
-// --- API Helper 1: Fetch from Sina ---
-async function getStockNameFromSina(stockCode, marketPrefix) {
-  const url = `https://hq.sinajs.cn/list=${marketPrefix}${stockCode}`;
-  console.log(`[DEBUG] Trying Sina API: ${url}`);
-  try {
-    const response = await fetch(url, { timeout: 3000 }); // 3 seconds timeout
-    if (!response.ok) return null;
-    
-    const responseBuffer = await response.arrayBuffer();
-    const responseText = new TextDecoder('gbk').decode(responseBuffer);
-    
-    const parts = responseText.split('"');
-    if (parts.length > 1 && parts[1] && parts[1].length > 1) {
-      return parts[1].split(',')[0];
-    }
-    return null;
-  } catch (error) {
-    console.error(`[DEBUG] Sina API Error:`, error.message);
-    return null;
-  }
+    const url = `https://hq.sinajs.cn/list=${marketPrefix}${stockCode}`;
+    try {
+        const response = await fetch(url, { timeout: 3000 });
+        if (!response.ok) return null;
+        const responseBuffer = await response.arrayBuffer();
+        const responseText = new TextDecoder('gbk').decode(responseBuffer);
+        const parts = responseText.split('"');
+        if (parts.length > 1 && parts[1] && parts[1].length > 1) {
+            return parts[1].split(',')[0];
+        }
+        return null;
+    } catch (error) {
+        console.error(`[DEBUG] Sina API call failed for ${stockCode}`, error);
+        return null;
+    }
 }
-
-// --- API Helper 2: Fetch from Tencent ---
 async function getStockNameFromTencent(stockCode, marketPrefix) {
-  let finalStockCode = stockCode;
-  if (marketPrefix === 'hk') {
-    // Tencent API requires HK stock codes to be padded to 5 digits
-    finalStockCode = stockCode.padStart(5, '0');
-  }
-  const url = `https://qt.gtimg.cn/q=${marketPrefix}${finalStockCode}`;
-  console.log(`[DEBUG] Trying Tencent API: ${url}`);
-  try {
-    const response = await fetch(url, { timeout: 3000 }); // 3 seconds timeout
-    if (!response.ok) return null;
-
-    const responseBuffer = await response.arrayBuffer();
-    const responseText = new TextDecoder('gbk').decode(responseBuffer);
-
-    // Tencent format: v_sz002074="51~国轩高科~002074~..." or v_hk00268="51~金蝶国际~..."
-    const parts = responseText.split('~');
-    if (parts.length > 1 && parts[1]) {
-      return parts[1];
-    }
-    return null;
-  } catch (error) {
-    console.error(`[DEBUG] Tencent API Error:`, error.message);
-    return null;
-  }
+    let finalStockCode = stockCode;
+    if (marketPrefix === 'hk') {
+        finalStockCode = stockCode.padStart(5, '0');
+    }
+    const url = `https://qt.gtimg.cn/q=${marketPrefix}${finalStockCode}`;
+    try {
+        const response = await fetch(url, { timeout: 3000 });
+        if (!response.ok) return null;
+        const responseBuffer = await response.arrayBuffer();
+        const responseText = new TextDecoder('gbk').decode(responseBuffer);
+        const parts = responseText.split('~');
+        if (parts.length > 1 && parts[1]) {
+            return parts[1];
+        }
+        return null;
+    } catch (error) {
+        console.error(`[DEBUG] Tencent API call failed for ${stockCode}`, error);
+        return null;
+    }
 }
-
-/**
- * Fetches the Chinese name of a stock using multiple APIs as fallbacks.
- * @param {string} stockCode The stock code (e.g., '002074').
- * @returns {Promise<string|null>} The Chinese name or null if not found.
- */
 async function getChineseStockName(stockCode) {
-  let marketPrefix;
-
-  // Rule for Hong Kong Stocks (numeric, <= 5 digits)
-  if (stockCode.length <= 5 && /^\d+$/.test(stockCode)) {
-    marketPrefix = 'hk';
-  } 
-  // Rule for A-Share Stocks & ETFs (numeric, 6 digits)
-  else if (stockCode.length === 6 && /^\d+$/.test(stockCode)) {
-    if (stockCode.startsWith('6') || stockCode.startsWith('51') || stockCode.startsWith('68')) {
-      marketPrefix = 'sh'; // Shanghai Stock, ETF, STAR Market
-    } else if (stockCode.startsWith('0') || stockCode.startsWith('3') || stockCode.startsWith('15') || stockCode.startsWith('1')) {
-      marketPrefix = 'sz'; // Shenzhen Stock & ETF
+    let marketPrefix;
+    if (stockCode.length <= 5 && /^\d+$/.test(stockCode)) {
+        marketPrefix = 'hk';
+    } else if (stockCode.length === 6 && /^\d+$/.test(stockCode)) {
+        if (stockCode.startsWith('6') || stockCode.startsWith('5')) {
+            marketPrefix = 'sh';
+        } else if (stockCode.startsWith('0') || stockCode.startsWith('3') || stockCode.startsWith('1')) {
+            marketPrefix = 'sz';
+        }
+    }
+    if (!marketPrefix) {
+        console.log(`[DEBUG] No market prefix found for stock code: ${stockCode}. (Ignoring, likely not A-share/HK)`);
+        return null;
     }
-  }
-
-  if (!marketPrefix) {
-    console.log(`[DEBUG] No known market rule for stock code: ${stockCode}`);
-    return null;
-  }
-
-  // --- Engine 1: Try Sina first ---
-  let chineseName = await getStockNameFromSina(stockCode, marketPrefix);
-  if (chineseName) {
-    console.log(`[DEBUG] Success from Sina API. Name: ${chineseName}`);
-    return chineseName;
-  }
-
-  // --- Engine 2: Fallback to Tencent ---
-  console.log(`[DEBUG] Sina API failed or returned empty, falling back to Tencent.`);
-  chineseName = await getStockNameFromTencent(stockCode, marketPrefix);
-  if (chineseName) {
-    console.log(`[DEBUG] Success from Tencent API. Name: ${chineseName}`);
-    return chineseName;
-  }
-
-  console.log(`[DEBUG] All APIs failed for stock code: ${stockCode}`);
-  return null;
+    console.log(`[DEBUG] Identified market '${marketPrefix}' for stock code: ${stockCode}`);
+    let chineseName = await getStockNameFromSina(stockCode, marketPrefix);
+    if (chineseName) return chineseName;
+    chineseName = await getStockNameFromTencent(stockCode, marketPrefix);
+    return chineseName;
 }
 
-/**
- * Extracts a stock code from the message body using a list of regex patterns.
- * @param {string} body The message body text.
- * @returns {{stockCode: string, originalText: string}|null} An object with the code and the full text that was matched, or null.
- */
-function extractStockCode(body) {
-    const patterns = [
-        /标的[:：][^(\n]*\(([^)]+)\)/,
-        /(?:标的|合约|symbol|ticker)[:：]\s*([a-zA-Z0-9\.]+)/i,
-        /"ticker"\s*:\s*"([^"]+)"/,
-        /\b(\d{6})\b/ // Fallback rule: matches any standalone 6-digit number
-    ];
+// --- Message Processing Function ---
+async function processMessage(body) {
+    let messageToProcess = body;
 
-    for (const pattern of patterns) {
-        const match = body.match(pattern);
-        if (match && match[1]) {
-            console.log(`[DEBUG] Matched with pattern: ${pattern}`);
-            // For the fallback rule, the originalText is just the code itself
-            const originalText = pattern.source === '\\b(\\d{6})\\b' ? match[1] : match[0];
-            return {
-                stockCode: match[1],
-                originalText: originalText,
-            };
+    // --- Pre-formatter for single-line signals (Robust Version) ---
+    if (!messageToProcess.includes('\n') && messageToProcess.includes('标的:') && messageToProcess.includes(',')) {
+        console.log('[DEBUG] Single-line signal detected. Applying new, robust multi-line formatting.');
+        
+        let tempBody = messageToProcess;
+        
+        // Keywords that should always start a new line
+        const keywords = ['周期:', '信号:', '级别:', '交易所时间:', '价格:', '原因:', '当前价格:'];
+        
+        // Step 1: Place a newline before each keyword, consuming any leading comma/space.
+        keywords.forEach(keyword => {
+            const regex = new RegExp(`[\\s,]*(${keyword})`, 'g');
+            tempBody = tempBody.replace(regex, `\n$1`);
+        });
+        
+        // Step 2: Replace any remaining commas (with optional following space) with a newline.
+        tempBody = tempBody.replace(/,\s*/g, '\n');
+        
+        // Step 3: Final cleanup to ensure consistent formatting
+        messageToProcess = tempBody.split('\n')
+                                    .map(line => line.trim())
+                                    .filter(line => line) // Remove any potential empty lines
+                                    .join('\n');
+        console.log(`[DEBUG] Pre-formatted message:\n${messageToProcess}`);
+    }
+
+
+    // --- Stock Name Enhancer ---
+    const alreadyFormattedMatch = messageToProcess.match(/标的\s*[:：].*?[（(]\s*\d{5,6}\s*[)）]/);
+    if (alreadyFormattedMatch) {
+        console.log(`[DEBUG] Message appears to be already name-formatted. No further action needed.`);
+        return messageToProcess;
+    }
+
+    const codeMatch = messageToProcess.match(/(标的\s*[:：]\s*\d{5,6})/);
+    if (codeMatch) {
+        const stringToReplace = codeMatch[0];
+        const stockCode = stringToReplace.match(/\d{5,6}/)[0];
+
+        console.log(`[DEBUG] Found code '${stockCode}' to process in block '${stringToReplace}'.`);
+        
+        const chineseName = await getChineseStockName(stockCode);
+        console.log(`[DEBUG] Fetched stock name: '${chineseName}' for code '${stockCode}'`);
+
+        if (chineseName) {
+            const prefix = stringToReplace.substring(0, stringToReplace.indexOf(stockCode));
+            const replacementString = `${prefix}${chineseName} （${stockCode}）`;
+            const newBody = messageToProcess.replace(stringToReplace, replacementString);
+            console.log(`[DEBUG] Content successfully replaced.`);
+            return newBody;
+        } else {
+            console.log(`[DEBUG] No Chinese name found. Name will not be added.`);
         }
+    } else {
+        console.log('[DEBUG] No replaceable stock code found.');
     }
-    return null;
+
+    return messageToProcess;
 }
+
 
 export default async function handler(req, res) {
-  console.log(`\n--- New Request Received at ${new Date().toISOString()} ---`);
-  try {
-    if (req.method !== 'POST') {
-      res.setHeader('Allow', 'POST');
-      return res.status(405).json({ error: 'Method Not Allowed' });
+  try {
+    if (req.method !== 'POST') {
+      return res.status(405).json({ error: 'Method Not Allowed' });
+    }
+    
+    const requestUrl = new URL(req.url, `https://${req.headers.host}`);
+    const proxyKey = requestUrl.searchParams.get('key');
+
+    if (!proxyKey) {
+        return res.status(400).json({ error: "Missing 'key' parameter." });
+    }
+    const proxyConfig = webhookMap[proxyKey];
+    if (!proxyConfig || !proxyConfig.url) {
+        return res.status(404).json({ error: `Proxy key '${proxyKey}' not found or misconfigured.` });
+    }
+    
+    const finalWebhookUrl = proxyConfig.url;
+    const destinationType = proxyConfig.type || 'raw'; 
+
+    const rawBody = (await getRawBody(req)).toString('utf8');
+    
+    let messageBody;
+    try {
+        const alertData = JSON.parse(rawBody);
+        messageBody = Object.entries(alertData)
+          .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
+          .join('\n');
+    } catch (e) {
+        messageBody = rawBody;
+    }
+    console.log(`[DEBUG] Received message body: ${messageBody}`);
+
+    // --- Apply all processing ---
+    const finalContent = await processMessage(messageBody);
+
+    // --- INTELLIGENT PAYLOAD FORMATTING ---
+    console.log(`[DEBUG] Final content being sent: ${finalContent}`);
+    let forwardResponse;
+    if (destinationType === 'wecom') {
+        const payload = {
+            msgtype: 'markdown',
+            markdown: { content: finalContent },
+        };
+        forwardResponse = await fetch(finalWebhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+    } else {
+        forwardResponse = await fetch(finalWebhookUrl, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+            body: finalContent,
+        });
+    }
+
+    if (!forwardResponse.ok) {
+        console.error(`[PROXY] Failed to forward. Key: ${proxyKey}, Type: ${destinationType}, Status: ${forwardResponse.status}, Body: ${await forwardResponse.text()}`);
+    } else {
+        console.log(`[PROXY] Successfully forwarded alert for key '${proxyKey}'.`);
     }
 
-    const webhookURL = process.env.WECHAT_WEBHOOK_URL || 'https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=cee69a01-8397-486c-a820-f44cd5181313';
+    return res.status(200).json({ success: true, message: `Alert processed for key '${proxyKey}'.` });
 
-    const rawBodyBuffer = await getRawBody(req);
-    const rawBody = rawBodyBuffer.toString('utf8');
-    console.log('[DEBUG] Received Raw Body:', rawBody);
-    
-    const normalizedBody = normalizeText(rawBody);
-    console.log('[DEBUG] Normalized Body:', normalizedBody);
-
-    let messageBody = normalizedBody;
-    // Keep the JSON parsing logic for compatibility, but apply it to the normalized body
-    if (req.headers['content-type']?.includes('application/json')) {
-        try {
-            const jsonData = JSON.parse(normalizedBody);
-            messageBody = Object.entries(jsonData)
-                .map(([key, value]) => `${key}: ${typeof value === 'object' ? JSON.stringify(value) : value}`)
-                .join('\n');
-        } catch(e) {
-            console.warn("[DEBUG] Content-Type is JSON, but body failed to parse. Treating as plain text.");
-            messageBody = normalizedBody;
-        }
-    }
-
-    let finalContent = messageBody;
-    
-    // --- 核心步骤: 只处理股票代码 ---
-    const stockInfo = extractStockCode(messageBody);
-    if (stockInfo) {
-      const { stockCode, originalText } = stockInfo;
-      console.log(`[DEBUG] Matched asset code: ${stockCode} from text: "${originalText}"`);
-      
-      const chineseName = await getChineseStockName(stockCode);
-      
-      if (chineseName) {
-        console.log(`[DEBUG] Translation successful. Final Name: ${chineseName}`);
-        // If using the fallback rule, we prepend the text "标的: "
-        const replacementText = `标的: ${chineseName} (${stockCode})`;
-        finalContent = messageBody.replace(originalText, replacementText);
-      } else {
-        console.log(`[DEBUG] Translation failed. Using original message.`);
-      }
-    } else {
-        console.log(`[DEBUG] No asset code found in the message body using any pattern.`);
-    }
-
-    console.log('[DEBUG] Final content to be sent:', finalContent);
-    const wechatResponse = await fetch(webhookURL, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        msgtype: 'markdown',
-        markdown: { content: finalContent },
-      }),
-    });
-
-    if (!wechatResponse.ok) {
-        const wechatResult = await wechatResponse.json();
-        console.error("Error sending to WeChat:", wechatResult);
-        throw new Error(`Failed to send message to WeChat: ${wechatResult.errmsg || 'Unknown error'}`);
-    }
-
-    return res.status(200).json({ success: true, message: 'Alert forwarded successfully' });
-
-  } catch (error) {
-    console.error('Webhook Error:', error.message);
-    return res.status(500).json({ error: 'Internal Server Error' });
-  }
+  } catch (error) {
+    console.error('Webhook Error:', error.message, error.stack);
+    return res.status(500).json({ error: 'Internal Server Error' });
+  }
 }
+
 
