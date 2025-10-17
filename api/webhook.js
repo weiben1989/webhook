@@ -1,30 +1,49 @@
-// /api/webhook-proxy.ts  —— 适配多格式信号 + 纯数字标的必查并替换中文名
-const fetch = require("node-fetch");
-const { URL } = require("url");
+import type { VercelRequest, VercelResponse } from "@vercel/node";
+import fetch from "node-fetch";
+import { AbortController } from "abort-controller";
 
-// FIX: Changed 'export const' to just 'const' for CommonJS compatibility.
-// This config is typically used by the Vercel platform, not by other modules.
-const config = {
-  api: { bodyParser: false },
+// Vercel 平台配置，禁用默认的 body 解析器，以便我们能读取原始请求体
+export const config = {
+  api: {
+    bodyParser: false,
+  },
 };
 
-// --- Webhook Configuration ---
-let webhookMap: Record<string, { url: string; type?: "raw" | "wecom" }> = {};
+// --- Webhook 配置 ---
+// 从 Vercel 环境变量 WEBHOOK_CONFIG 中读取配置
+// 格式: {"your_key": {"url": "WECOM_WEBHOOK_URL", "type": "wecom"}}
+interface WebhookConfig {
+  url: string;
+  type?: "raw" | "wecom"; // 支持 'wecom' (企业微信) 或 'raw' (原始文本)
+}
+let webhookMap: Record<string, WebhookConfig> = {};
 try {
-  if (process.env.WEBHOOK_CONFIG) webhookMap = JSON.parse(process.env.WEBHOOK_CONFIG);
-} catch {
+  if (process.env.WEBHOOK_CONFIG) {
+    webhookMap = JSON.parse(process.env.WEBHOOK_CONFIG);
+  }
+} catch (e) {
+  console.error("无法解析 WEBHOOK_CONFIG 环境变量:", e);
   webhookMap = {};
 }
 
-/* ================= 基础工具 ================= */
-function getRawBody(req: any, maxSize = 1024 * 1024): Promise<Buffer> {
+/* ==================================
+ * 基础工具函数
+ * ================================== */
+
+/**
+ * 获取请求的原始 body
+ * @param req Vercel 请求对象
+ * @param maxSize 最大体积限制 (默认 1MB)
+ * @returns 返回 Buffer 格式的 body
+ */
+function getRawBody(req: VercelRequest, maxSize = 1024 * 1024): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     let size = 0;
     req.on("data", (chunk: Buffer) => {
       size += chunk.length;
       if (size > maxSize) {
-        reject(new Error("Payload too large"));
+        reject(new Error("请求体过大 (Payload too large)"));
         req.destroy();
         return;
       }
@@ -35,48 +54,59 @@ function getRawBody(req: any, maxSize = 1024 * 1024): Promise<Buffer> {
   });
 }
 
-async function fetchWithTimeout(input: any, opts: any = {}) {
-  const { timeout = 1500, ...rest } = opts;
-  // AbortController is not available in all node environments, but node-fetch@2 supports it.
-  const AbortController = globalThis.AbortController || require("abort-controller");
+/**
+ * 带超时功能的 fetch 函数
+ * @param url 请求地址
+ * @param options fetch 选项，额外包含 timeout 参数
+ * @returns 返回 fetch 的响应
+ */
+async function fetchWithTimeout(url: string, options: any = {}) {
+  const { timeout = 2000, ...rest } = options;
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), timeout);
-  
+
   try {
-    const response = await fetch(input, { ...rest, signal: controller.signal });
+    const response = await fetch(url, { ...rest, signal: controller.signal });
     return response;
   } finally {
     clearTimeout(id);
   }
 }
 
-function stringifyAlertBody(raw: string) {
+/**
+ * 将请求体（可能是JSON）转化为可读的字符串
+ * @param raw 原始字符串
+ * @returns 格式化后的字符串
+ */
+function stringifyAlertBody(raw: string): string {
   try {
     const obj = JSON.parse(raw);
     return Object.entries(obj)
       .map(([k, v]) => `${k}: ${typeof v === "object" ? JSON.stringify(v) : String(v)}`)
       .join("\n");
   } catch {
-    return raw;
+    return raw; // 如果不是合法的 JSON，直接返回原文
   }
 }
 
-/* ============== A/H 名称查询（纯数字必查） ============== */
-// Node18 的 TextDecoder 支持 GB18030，兼容 GBK 内容
+/* ==================================
+ * 股票中文名查询模块
+ * ================================== */
+
+// 使用 TextDecoder 处理新浪/腾讯接口返回的 GBK 编码
 const gbDecoder = new TextDecoder("gb18030");
 
-function padHK(code: string) {
-  return String(code).padStart(5, "0"); // 港股 5 位
-}
-
-async function getStockNameFromSina(stockCode: string, marketPrefix: "hk" | "sh" | "sz") {
-  const finalCode = marketPrefix === "hk" ? padHK(stockCode) : stockCode;
+/**
+ * 查询股票中文名 (新浪接口)
+ * @param stockCode 股票代码
+ * @param marketPrefix 市场前缀 'sh', 'sz', 'hk'
+ * @returns 股票名称或 null
+ */
+async function getStockNameFromSina(stockCode: string, marketPrefix: "hk" | "sh" | "sz"): Promise<string | null> {
+  const finalCode = marketPrefix === "hk" ? String(stockCode).padStart(5, "0") : stockCode;
   const url = `https://hq.sinajs.cn/list=${marketPrefix}${finalCode}`;
   try {
-    const resp = await fetchWithTimeout(url, {
-      timeout: 1500,
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
+    const resp = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } });
     if (!resp.ok) return null;
     const buf = await resp.arrayBuffer();
     const text = gbDecoder.decode(buf);
@@ -87,236 +117,210 @@ async function getStockNameFromSina(stockCode: string, marketPrefix: "hk" | "sh"
   }
 }
 
-async function getStockNameFromTencent(stockCode: string, marketPrefix: "hk" | "sh" | "sz") {
-  const finalCode = marketPrefix === "hk" ? padHK(stockCode) : stockCode;
+/**
+ * 查询股票中文名 (腾讯接口)
+ * @param stockCode 股票代码
+ * @param marketPrefix 市场前缀 'sh', 'sz', 'hk'
+ * @returns 股票名称或 null
+ */
+async function getStockNameFromTencent(stockCode: string, marketPrefix: "hk" | "sh" | "sz"): Promise<string | null> {
+  const finalCode = marketPrefix === "hk" ? String(stockCode).padStart(5, "0") : stockCode;
   const url = `https://qt.gtimg.cn/q=${marketPrefix}${finalCode}`;
   try {
-    const resp = await fetchWithTimeout(url, {
-      timeout: 1500,
-      headers: { "User-Agent": "Mozilla/5.0" },
-    });
+    const resp = await fetchWithTimeout(url, { headers: { "User-Agent": "Mozilla/5.0" } });
     if (!resp.ok) return null;
     const buf = await resp.arrayBuffer();
     const text = gbDecoder.decode(buf);
     const parts = text.split("~");
-    if (parts.length > 2) return parts[1]?.trim() || null;
-    return null;
+    return parts.length > 1 ? parts[1]?.trim() || null : null;
   } catch {
     return null;
   }
 }
 
-async function getChineseStockName(code: string) {
-  // 这里严格把“纯数字标的”都做查询：
-  // - 长度 1~5 位：按港股处理（hk）
-  // - 长度 6 位：按 A 股处理（sh/sz）
+/**
+ * 智能判断市场并获取股票中文名 (新浪/腾讯双接口备份)
+ * @param code 纯数字股票代码
+ * @returns 股票名称或 null
+ */
+async function getChineseStockName(code: string): Promise<string | null> {
   let prefix: "hk" | "sh" | "sz" | null = null;
   if (/^\d{1,5}$/.test(code)) {
-    prefix = "hk";
+    prefix = "hk"; // 1-5位数字，按港股处理
   } else if (/^\d{6}$/.test(code)) {
-    if (/^[56]/.test(code)) prefix = "sh";
-    else if (/^[013]/.test(code)) prefix = "sz";
-    else prefix = null;
+    if (/^[568]/.test(code)) prefix = "sh"; // 6位数字，5,6,8开头为沪市
+    else if (/^[013]/.test(code)) prefix = "sz"; // 0,1,3开头为深市
   }
   if (!prefix) return null;
 
-  // 先新浪再腾讯
+  // 优先使用新浪接口，失败后尝试腾讯接口
   let name = await getStockNameFromSina(code, prefix);
   if (!name) name = await getStockNameFromTencent(code, prefix);
   return name || null;
 }
 
-// 仅在“标的:”后面是**纯数字(1~6位)**时打标进行查询替换
-function replaceTargets(body: string) {
-  return body.replace(/(标的\s*[:：]\s*)(\d{1,6})/g, (m, g1, code) => {
-    if (!/^\d{1,6}$/.test(code)) return m;
-    return `${g1}__LOOKUP__${code}__`;
-  });
-}
+/**
+ * 并行查询所有需要查找的股票代码并替换回原文
+ * @param text 原始消息文本
+ * @returns 替换名称后的消息文本
+ */
+async function resolveStockNames(text: string): Promise<string> {
+  // 匹配所有形如 "标的: 12345" 的纯数字代码
+  const lookupRegex = /(标的\s*[:：]\s*)(\d{1,6})\b/g;
+  const matches = [...text.matchAll(lookupRegex)];
+  const codesToLookup = [...new Set(matches.map(match => match[2]))];
 
-// --- 已替换为优化后的版本 ---
-// 这个函数现在可以并行查询，并且能优雅地处理查询失败的情况
-async function resolveTargets(text: string): Promise<string> {
-  // 1. 找出所有标记了要查询的代码，并去重
-  const codes = [...new Set((text.match(/__LOOKUP__(\d{1,6})__/g) || []).map(s => s.slice(10, -2)))];
-  if (codes.length === 0) {
+  if (codesToLookup.length === 0) {
     return text;
   }
 
-  // 2. 并行发起所有网络查询，等待全部结果返回
-  const names = await Promise.all(codes.map(c => getChineseStockName(c)));
-  
-  // 3. 创建一个从“代码”到“名称”的映射表
-  const nameMap = Object.fromEntries(codes.map((code, i) => [code, names[i]]));
+  // 并行查询所有股票的名称
+  const namePromises = codesToLookup.map(code => getChineseStockName(code));
+  const names = await Promise.all(namePromises);
 
-  // 4. 一次性替换所有占位符
-  return text.replace(/__LOOKUP__(\d{1,6})__/g, (match, code) => {
-    const name = nameMap[code];
-    // 如果找到了名称，就替换为 "名称(代码)"，否则就替换回代码本身
-    return name ? `${name}(${code})` : code;
+  // 创建一个 代码 -> 名称 的映射表
+  const nameMap = new Map(codesToLookup.map((code, i) => [code, names[i]]));
+
+  // 一次性替换所有匹配项
+  return text.replace(lookupRegex, (match, prefix, code) => {
+    const name = nameMap.get(code);
+    return name ? `${prefix}${name}(${code})` : match; // 如果找到名称，替换为 "名称(代码)"，否则保持原样
   });
 }
 
+/* ==================================
+ * 信号解析与美化
+ * ================================== */
 
-/* ============== 信号解析与展示 ============== */
-function detectDirection(s?: string) {
-  const t = (s || "").toLowerCase();
-  if (/(空信号|做空|空单|卖信号|short|sell|调仓空|追击空)/i.test(t)) return "short";
-  if (/(多信号|做多|多单|买信号|long|buy|调仓多|追击多)/i.test(t)) return "long";
-  if (/止损/i.test(t)) return "stop";
-  return "neutral";
+const Direction = {
+  Long: "long",
+  Short: "short",
+  Stop: "stop",
+  Neutral: "neutral",
+} as const;
+type DirectionType = typeof Direction[keyof typeof Direction];
+
+function detectDirection(s: string = ""): DirectionType {
+  const t = s.toLowerCase();
+  if (/(空信号|做空|空单|卖信号|short|sell|调仓空|追击空)/i.test(t)) return Direction.Short;
+  if (/(多信号|做多|多单|买信号|long|buy|调仓多|追击多)/i.test(t)) return Direction.Long;
+  if (/止损/i.test(t)) return Direction.Stop;
+  return Direction.Neutral;
 }
-function icon(d: string) {
-  if (d === "short") return "🔴 空";
-  if (d === "long") return "🟢 多";
-  if (d === "stop") return "⚠️ 止损";
-  return "🟦 中性";
-}
-function stripBullet(s: string) {
-  return s.replace(/^[\-\u2022\*]\s+/, "").trim(); // 去掉 - / • / *
-}
 
-// 专门兼容“信号详情 + 多行 KV 卡片”，否则走通用块切分
-function splitAlertsGeneric(text: string) {
-  const t = (text || "").trim();
-  if (!t) return [];
-
-  const lines0 = t.split("\n").map(s => s.trim()).filter(Boolean);
-  const isKvCard =
-    /^信号详情$/i.test(lines0[0] || "") ||
-    (lines0.length >= 3 && /^[-\s]*标的\s*[:：]/.test(lines0[0]) && /^[-\s]*周期\s*[:：]/.test(lines0[1]));
-
-  if (isKvCard) {
-    const fields: string[] = [];
-    for (const raw of lines0) {
-      const line = stripBullet(raw);
-      if (/^信号详情$/i.test(line)) continue;
-      if (/^(标的|周期|价格|当前价格|信号|指标)\s*[:：]/.test(line)) fields.push(line);
-    }
-    return fields.length ? [fields.join(", ")] : [t];
+function getIcon(d: DirectionType): string {
+  switch (d) {
+    case Direction.Long: return "🟢 多";
+    case Direction.Short: return "🔴 空";
+    case Direction.Stop: return "⚠️ 止损";
+    default: return "🟦 中性";
   }
+}
 
-  // 常规路径：以“标的:”为起点，直到下一个“标的:”为止
-  const lines = t.split("\n").map(s => stripBullet(s)).filter(Boolean);
-  const blocks: string[] = [];
-  let buf: string[] = [];
-  const flush = () => { if (buf.length) { blocks.push(buf.join(", ")); buf = []; } };
+/**
+ * 格式化最终发送到企业微信的 Markdown 消息
+ * @param content 经过名称解析后的内容
+ * @returns 格式化后的 Markdown 字符串
+ */
+function beautifyAlerts(content: string): string {
+  const lines = content.trim().split('\n').map(l => l.trim()).filter(Boolean);
+  const alerts: string[] = [];
 
   for (const line of lines) {
-    if (/^标的\s*[:：]/.test(line)) { flush(); buf.push(line); }
-    else { if (buf.length === 0) continue; buf.push(line); } // 丢弃没有标的的“孤儿行”
-  }
-  flush();
-  return blocks.length ? blocks : [stripBullet(t)];
-}
+    const stockMatch = line.match(/标的\s*[:：]\s*([^\s,，!！]+)/);
+    if (!stockMatch) continue; // 忽略没有标的的行
 
-function parseLine(line: string) {
-  const raw = line.trim();
+    const stock = stockMatch[1];
+    const period = line.match(/周期\s*[:：]\s*([^\s,，!！]+)/)?.[1];
+    const price = line.match(/(?:当前)?价格\s*[:：]\s*([^\s,，!！]+)/)?.[1];
+    const signal = line.match(/信号\s*[:：]\s*([^\s,，!！]+)/)?.[1] || line; // 兜底为整行内容
+    const indicator = line.match(/指标\s*[:：]\s*([^\s,，!！]+)/)?.[1];
+    
+    const direction = detectDirection(signal);
+    const icon = getIcon(direction);
 
-  // 基础字段
-  const stock = raw.match(/标的\s*[:：]\s*([^\s,，!！]+)/)?.[1];
-  const period = raw.match(/周期\s*[:：]\s*([0-9]+)/)?.[1];
-  const price = raw.match(/(当前价格|价格)\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)/)?.[2];
-  const indicator = raw.match(/指标\s*[:：]\s*([^\s,，!！]+)/)?.[1];
-
-  // 优先：显式“信号: xxx”
-  let signal = raw.match(/信号\s*[:：]\s*([^,，!！]+)/)?.[1];
-
-  // 兜底：从“周期:”之后到“价格/指标”之前的自由文本
-  if (!signal) {
-    let seg = raw;
-    const idxPeriod = raw.search(/周期\s*[:：]/);
-    if (idxPeriod >= 0) {
-      const afterPeriod = raw.slice(idxPeriod);
-      const commaIdx = afterPeriod.indexOf(",");
-      seg = commaIdx >= 0 ? afterPeriod.slice(commaIdx + 1) : afterPeriod;
-    }
-    seg = seg
-      .replace(/(当前价格|价格)\s*[:：].*$/, "")
-      .replace(/指标\s*[:：].*$/, "")
-      .replace(/^[，,\s\-]+/, "")
-      .replace(/[，,!\s\-]+$/, "")
-      .replace(/-?\s*标的\s*[:：].*$/i, "")
+    let parts: string[] = [];
+    parts.push(`${icon}｜**${stock}**`);
+    if (period) parts.push(`周期: ${period}`);
+    if (price) parts.push(`价格: ${price}`);
+    // 过滤掉已经提取的字段，显示剩余信息作为信号描述
+    const remainingSignal = signal
+      .replace(/标的\s*[:：]\s*[^\s,，!！]+/, "")
+      .replace(/周期\s*[:：]\s*[^\s,，!！]+/, "")
+      .replace(/(?:当前)?价格\s*[:：]\s*[^\s,，!！]+/, "")
+      .replace(/指标\s*[:：]\s*[^\s,，!！]+/, "")
+      .replace(/[,，]/g, ' ')
       .trim();
-    if (seg) signal = seg;
+
+    if (remainingSignal && !/(多信号|空信号|买信号|卖信号)/.test(remainingSignal)) {
+      parts.push(remainingSignal);
+    }
+    if (indicator) parts.push(`指标: ${indicator}`);
+    
+    alerts.push(`- ${parts.join(" · ")}`);
   }
 
-  const direction = detectDirection(signal);
-  return { raw, stock, period, price, signal, indicator, direction };
+  // 如果没有解析出任何有效信号，则返回原始内容，防止消息丢失
+  return alerts.length > 0 ? alerts.join("\n") : content;
 }
 
-// 只输出干净列表（无标题/统计），严格要求：有“标的”且（有“信号”或“价格”）
-function beautifyAlerts(content: string) {
-  const chunks = splitAlertsGeneric(content);
-  const parsed = chunks.map(parseLine);
-  const valid = parsed.filter(p => !!p.stock && (!!p.signal || !!p.price));
-  if (!valid.length) return content;
-
-  return valid
-    .map(p => {
-      const parts: string[] = [];
-      parts.push(`${icon(p.direction)}｜${p.stock}`);
-      if (p.period) parts.push(`周期${p.period}`);
-      if (p.price) parts.push(`价格 ${p.price}`);
-      if (p.signal) parts.push(p.signal);
-      if (p.indicator) parts.push(`指标 ${p.indicator}`);
-      return `- ${parts[0]}${parts.length > 1 ? " · " + parts.slice(1).join(" · ") : ""}`;
-    })
-    .join("\n");
-}
-
-/* ================= 主 Handler ================= */
-// FIX: Changed 'export default' to 'module.exports' for CommonJS entry point.
-// Also, export the config object for the Vercel platform to consume.
-module.exports = async function handler(req: any, res: any) {
+/* ==================================
+ * 主处理函数
+ * ================================== */
+export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
-    if (req.method !== "POST") return res.status(405).json({ error: "Method Not Allowed" });
+    if (req.method !== "POST") {
+      return res.status(405).json({ error: "只允许 POST 请求 (Method Not Allowed)" });
+    }
 
-    const url = new URL(req.url, `https://${req.headers.host}`);
-    const key = url.searchParams.get("key");
+    const key = req.query.key as string;
     const cfg = key ? webhookMap[key] : undefined;
-    if (!cfg?.url) return res.status(404).json({ error: "Key not found" });
+    if (!cfg?.url) {
+      return res.status(404).json({ error: "未找到对应的 key 配置 (Key not found)" });
+    }
 
-    // 读取原始 body
+    // 1. 读取原始请求体
     const rawBody = (await getRawBody(req)).toString("utf8");
     const messageBody = stringifyAlertBody(rawBody);
 
-    // ——① 标的名替换（纯数字 1~6 位必查并转中文名(代码)）——
-    const marked = replaceTargets(messageBody);
-    const resolved = await resolveTargets(marked);
+    // 2. 查询并替换股票中文名
+    const resolvedBody = await resolveStockNames(messageBody);
 
-    // ——② 展示层美化（无标题，纯列表）——
-    const finalText = beautifyAlerts(resolved);
+    // 3. 美化消息格式
+    const finalText = beautifyAlerts(resolvedBody);
+    
+    // 如果处理后内容为空，则不发送
+    if (!finalText.trim()) {
+        return res.status(200).json({ success: true, message: "内容为空，已忽略" });
+    }
 
-    // ——③ 转发——
+    // 4. 转发到目标地址
     const isWecom = cfg.type === "wecom";
-    // --- FIX: Use fetchWithTimeout for the final forwarding request ---
-    // This prevents the function from crashing due to a slow destination server.
     const resp = await fetchWithTimeout(cfg.url, {
       method: "POST",
-      headers: isWecom
-        ? { "Content-Type": "application/json" }
-        : { "Content-Type": "text/plain; charset=utf-8" },
+      headers: {
+        "Content-Type": isWecom ? "application/json" : "text/plain; charset=utf-8",
+      },
       body: isWecom
         ? JSON.stringify({ msgtype: "markdown", markdown: { content: finalText } })
         : finalText,
-      timeout: 3000 // Set a 3-second timeout for forwarding
+      timeout: 3000, // 转发超时设为3秒
     });
 
     if (!resp.ok) {
-      const txt = await resp.text();
-      return res.status(502).json({ error: `Forward failed: ${txt}` });
+      const errorText = await resp.text();
+      console.error("转发失败:", errorText);
+      return res.status(502).json({ error: `转发失败 (Forward failed): ${errorText}` });
     }
+
     res.status(200).json({ success: true });
+
   } catch (err: any) {
-    console.error(err);
-    // Log the error with more context for better debugging
-    res.status(500).json({ 
-        error: "Internal Server Error", 
-        message: err.message,
-        name: err.name // e.g., 'AbortError' if it's a timeout
+    console.error("发生内部错误:", err);
+    res.status(500).json({
+      error: "服务器内部错误 (Internal Server Error)",
+      message: err.message,
+      name: err.name,
     });
   }
 }
-
-module.exports.config = config;
