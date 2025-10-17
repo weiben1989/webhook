@@ -320,4 +320,3 @@ module.exports = async function handler(req: any, res: any) {
 }
 
 module.exports.config = config;
-
